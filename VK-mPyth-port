@@ -1,0 +1,606 @@
+# ESP32 MicroPython BLE RaceBox Client
+# Converted from Arduino/NimBLE C++ code by Vincent Kratzer (GPL-3.0)
+# MicroPython adaptation - requires ESP32 with MicroPython firmware
+#
+# Dependencies:
+#   - Built-in: bluetooth, struct, time, sys
+#   - Optional OLED display: ssd1351 MicroPython driver (SPI color OLED)
+#     e.g. https://github.com/rdagger/micropython-ssd1351
+#
+# Flash this file as main.py on your ESP32 MicroPython device.
+
+import bluetooth
+import struct
+import time
+import sys
+from micropython import const
+
+# =================== IMPORTANT SETTING ===================
+# Uncomment and set this to connect to a specific RaceBox by address:
+# TARGET_DEVICE_ADDRESS = "aa:bb:cc:dd:ee:ff"
+# If left as None, connects to any device advertising a name starting with "RaceBox"
+TARGET_DEVICE_ADDRESS = None
+# =========================================================
+
+# -------- Optional OLED display (SPI 128x128 color) --------
+OLED_ENABLED = False  # Set to True if you have an SSD1351 OLED wired up
+
+if OLED_ENABLED:
+    from machine import SPI, Pin
+    # SPI pin mapping (match your wiring)
+    SCLK_PIN  = 18
+    MOSI_PIN  = 23
+    DC_PIN    = 17
+    CS_PIN    = 5
+    RST_PIN   = 16
+    SCREEN_WIDTH  = 128
+    SCREEN_HEIGHT = 128
+
+    # Attempt to import driver - install ssd1351.py on your device first
+    try:
+        from ssd1351 import SSD1351
+        spi = SPI(1, baudrate=8000000, sck=Pin(SCLK_PIN), mosi=Pin(MOSI_PIN))
+        oled = SSD1351(SCREEN_WIDTH, SCREEN_HEIGHT, spi,
+                       dc=Pin(DC_PIN), cs=Pin(CS_PIN), rst=Pin(RST_PIN))
+        oled.fill(0)
+        oled.show()
+        print("OLED initialised.")
+    except Exception as e:
+        print(f"OLED init failed: {e}")
+        OLED_ENABLED = False
+
+# -------- 16-bit RGB565 colour constants --------
+COLOR_BLACK   = const(0x0000)
+COLOR_BLUE    = const(0x001F)
+COLOR_RED     = const(0xF800)
+COLOR_GREEN   = const(0x07E0)
+COLOR_CYAN    = const(0x07FF)
+COLOR_MAGENTA = const(0xF81F)
+COLOR_YELLOW  = const(0xFFE0)
+COLOR_WHITE   = const(0xFFFF)
+
+# -------- BLE UUIDs --------
+UART_SERVICE_UUID = bluetooth.UUID("6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
+TX_CHAR_UUID      = bluetooth.UUID("6E400003-B5A3-F393-E0A9-E50E24DCCA9E")
+# RX_CHAR_UUID    = bluetooth.UUID("6E400002-B5A3-F393-E0A9-E50E24DCCA9E")  # not used
+
+# -------- Output rate limiting --------
+OUTPUT_FREQ_HZ_SERIAL = 8   # Hz
+OUTPUT_INTERVAL_MS    = 1000 // OUTPUT_FREQ_HZ_SERIAL
+
+# -------- Global state --------
+do_connect   = False
+connected    = False
+updated_data = False          # True when a fresh RaceBox Data Message has been parsed
+device_type  = -1             # 0 = Mini/Mini S, 1 = Micro, -1 = unknown
+racebox_addr = None           # bytes address of the found RaceBox
+ble_handle   = None           # connection handle (int)
+notify_handle = None          # characteristic value handle for TX notifications
+last_output_time_serial = 0
+
+# -------- Parsed data fields (populated by parse_racebox_data_message) --------
+iTOW = year = month = day = hour = minute = second = 0
+validity_flags = time_accuracy = nanoseconds = 0
+fix_status = fix_status_flags = datetime_flags = num_svs = 0
+longitude = latitude = wgs_altitude = msl_altitude = 0
+horizontal_accuracy = vertical_accuracy = 0
+speed_val = heading = speed_accuracy = heading_accuracy = 0
+pdop = lat_lon_flags = battery_status = 0
+g_force_x = g_force_y = g_force_z = 0
+rot_rate_x = rot_rate_y = rot_rate_z = 0
+heading_degrees = 0.0
+compass_direction = ""
+
+
+# ================================================================
+#  Utility helpers
+# ================================================================
+
+def get_compass_direction(deg):
+    """Return cardinal/intercardinal string for a heading in degrees."""
+    if deg >= 337.5 or deg < 22.5:   return "N"
+    if deg < 67.5:                    return "NE"
+    if deg < 112.5:                   return "E"
+    if deg < 157.5:                   return "SE"
+    if deg < 202.5:                   return "S"
+    if deg < 247.5:                   return "SW"
+    if deg < 292.5:                   return "W"
+    if deg < 337.5:                   return "NW"
+    return ""
+
+
+def decode_battery_status(batt):
+    """Print battery info, interpretation differs by device type."""
+    global device_type
+    if device_type == 0:
+        is_charging   = bool(batt & 0x80)
+        battery_level = batt & 0x7F
+        print(f"RaceBox Mini/Mini S - Charging: {'Yes' if is_charging else 'No'}, "
+              f"Battery: {battery_level}%")
+    elif device_type == 1:
+        input_voltage = batt / 10.0
+        print(f"RaceBox Micro - Input Voltage: {input_voltage:.1f} V")
+    else:
+        print("Battery status: Unknown device type")
+
+
+def calculate_checksum(data, packet_length):
+    """Fletcher-8 checksum used by RaceBox/u-blox protocol."""
+    ck_a = 0
+    ck_b = 0
+    for i in range(2, packet_length - 2):
+        ck_a = (ck_a + data[i]) & 0xFF
+        ck_b = (ck_b + ck_a)   & 0xFF
+    return ck_a, ck_b
+
+
+# ================================================================
+#  Payload parsing
+# ================================================================
+
+def parse_payload(data: bytes):
+    """
+    Entry point called for every BLE notification.
+    Validates the packet, identifies message type, dispatches to the
+    appropriate parser.
+    """
+    global updated_data
+
+    # ---- Frame-start check ----
+    if len(data) < 8 or data[0] != 0xB5 or data[1] != 0x62:
+        print("Invalid frame start - not a RaceBox packet (or other data).")
+        return
+
+    # ---- Extract header fields ----
+    msg_class      = data[2]
+    msg_id         = data[3]
+    payload_length = struct.unpack_from('<H', data, 4)[0]
+
+    # ---- Packet length sanity check ----
+    packet_length = 6 + payload_length + 2   # 6 header bytes + payload + 2 checksum bytes
+    if packet_length > 512:
+        print(f"Packet too large ({packet_length} bytes), ignoring.")
+        return
+    if len(data) < packet_length:
+        print(f"Received {len(data)} bytes but expected {packet_length}, ignoring.")
+        return
+
+    # ---- Checksum validation ----
+    ck_a, ck_b = calculate_checksum(data, packet_length)
+    if data[packet_length - 2] != ck_a or data[packet_length - 1] != ck_b:
+        print("Checksum validation failed, discarding packet.")
+        return
+
+    # ---- Dispatch by message class / ID ----
+    if msg_class == 0xFF and msg_id == 0x01:
+        parse_racebox_data_message(data)
+    elif msg_class == 0xFF and msg_id == 0x21:
+        print("History Data Message received (parsing not implemented).")
+    elif msg_class == 0xFF and msg_id == 0x22:
+        print("Standalone Recording Status received (parsing not implemented).")
+    elif msg_class == 0xFF and msg_id == 0x23:
+        print("Recorded Data Download received (parsing not implemented).")
+    elif msg_class == 0xFF and msg_id == 0x26:
+        print("Standalone Recording State Change received (parsing not implemented).")
+    else:
+        print(f"Unknown message class=0x{msg_class:02X} id=0x{msg_id:02X}, ignoring.")
+
+
+def parse_racebox_data_message(data: bytes):
+    """
+    Unpack all fields from an 80-byte RaceBox Data Message payload.
+    Offsets are per the RaceBox datasheet (header at 0, payload at 6).
+    """
+    global iTOW, year, month, day, hour, minute, second
+    global validity_flags, time_accuracy, nanoseconds
+    global fix_status, fix_status_flags, datetime_flags, num_svs
+    global longitude, latitude, wgs_altitude, msl_altitude
+    global horizontal_accuracy, vertical_accuracy
+    global speed_val, heading, speed_accuracy, heading_accuracy
+    global pdop, lat_lon_flags, battery_status
+    global g_force_x, g_force_y, g_force_z
+    global rot_rate_x, rot_rate_y, rot_rate_z
+    global heading_degrees, compass_direction, updated_data
+
+    # struct.unpack_from(fmt, buffer, offset)
+    # '<' = little-endian  I=uint32  H=uint16  B=uint8  i=int32  h=int16
+    iTOW             = struct.unpack_from('<I', data, 6)[0]
+    year             = struct.unpack_from('<H', data, 10)[0]
+    month            = data[12]
+    day              = data[13]
+    hour             = data[14]
+    minute           = data[15]
+    second           = data[16]
+    validity_flags   = data[17]
+    time_accuracy    = struct.unpack_from('<I', data, 18)[0]
+    nanoseconds      = struct.unpack_from('<I', data, 22)[0]
+    fix_status       = data[26]
+    fix_status_flags = data[27]
+    datetime_flags   = data[28]
+    num_svs          = data[29]
+    longitude        = struct.unpack_from('<i', data, 30)[0]   # signed
+    latitude         = struct.unpack_from('<i', data, 34)[0]   # signed
+    wgs_altitude     = struct.unpack_from('<i', data, 38)[0]   # signed
+    msl_altitude     = struct.unpack_from('<i', data, 42)[0]   # signed
+    horizontal_accuracy = struct.unpack_from('<I', data, 46)[0]
+    vertical_accuracy   = struct.unpack_from('<I', data, 50)[0]
+    speed_val        = struct.unpack_from('<I', data, 54)[0]
+    heading          = struct.unpack_from('<I', data, 58)[0]
+    speed_accuracy   = struct.unpack_from('<I', data, 62)[0]
+    heading_accuracy = struct.unpack_from('<I', data, 66)[0]
+    pdop             = struct.unpack_from('<H', data, 70)[0]
+    lat_lon_flags    = data[72]
+    battery_status   = data[73]
+    g_force_x        = struct.unpack_from('<h', data, 74)[0]   # signed int16
+    g_force_y        = struct.unpack_from('<h', data, 76)[0]
+    g_force_z        = struct.unpack_from('<h', data, 78)[0]
+
+    # Note: rotRateX/Y/Z were in the original global list but not in the
+    # datasheet offsets above (the 80-byte payload ends at offset 79).
+    # Set to 0 until confirmed offset is available from datasheet.
+    rot_rate_x = rot_rate_y = rot_rate_z = 0
+
+    heading_degrees   = heading / 100000.0
+    compass_direction = get_compass_direction(heading_degrees)
+    updated_data      = True
+
+
+# ================================================================
+#  Serial output
+# ================================================================
+
+def print_data_to_serial():
+    """Rate-limited serial printout of the latest parsed RaceBox data."""
+    global last_output_time_serial
+
+    now = time.ticks_ms()
+    if time.ticks_diff(now, last_output_time_serial) < OUTPUT_INTERVAL_MS:
+        print("(skipping serial output - rate limited)")
+        return
+    last_output_time_serial = now
+
+    fix_text = {0: "No Fix", 2: "2D Fix", 3: "3D Fix"}.get(fix_status, "Unknown")
+
+    print()
+    print("--- Updated values from RaceBox Data Message ---")
+    print("-" * 66)
+    print(f"iTOW:               {iTOW} ms")
+    print(f"Date (UTC):         {year:04d}-{month:02d}-{day:02d}")
+    print(f"Time (UTC):         {hour:02d}:{minute:02d}:{second:02d}")
+    print(f"GPS Fix:            {fix_text}")
+    print(f"Satellites:         {num_svs}")
+    print(f"Latitude:           {latitude  / 1e7:.7f} deg")
+    print(f"Longitude:          {longitude / 1e7:.7f} deg")
+    print(f"WGS Altitude:       {wgs_altitude / 1000.0:.2f} m")
+    print(f"MSL Altitude:       {msl_altitude / 1000.0:.2f} m")
+    print(f"Horiz. Accuracy:    {horizontal_accuracy / 1000.0:.2f} m")
+    print(f"Vert.  Accuracy:    {vertical_accuracy  / 1000.0:.2f} m")
+    print(f"Speed:              {speed_val / 1000.0:.2f} m/s  "
+          f"({speed_val * 3.6 / 1000.0:.2f} km/h)")
+    print(f"Speed Accuracy:     {speed_accuracy / 1000.0:.2f} m/s")
+    heading_valid = bool(fix_status_flags & 0x20)
+    print(f"Heading:            {heading_degrees:.1f} deg  "
+          f"({compass_direction})  "
+          f"[{'valid' if heading_valid else 'NOT valid - may need movement'}]")
+    print(f"Heading Accuracy:   {heading_accuracy / 1e5:.1f} deg")
+    print(f"PDOP:               {pdop / 100.0:.2f}")
+    print(f"G-Force X:          {g_force_x / 1000.0:.3f} G")
+    print(f"G-Force Y:          {g_force_y / 1000.0:.3f} G")
+    print(f"G-Force Z:          {g_force_z / 1000.0:.3f} G")
+    print(f"Rot Rate X:         {rot_rate_x / 100.0:.2f} deg/s")
+    print(f"Rot Rate Y:         {rot_rate_y / 100.0:.2f} deg/s")
+    print(f"Rot Rate Z:         {rot_rate_z / 100.0:.2f} deg/s")
+    print("Fix Status Flags:")
+    print(f"  Bit 0  Valid Fix:                    {'Yes' if fix_status_flags & 0x01 else 'No'}")
+    print(f"  Bit 1  Diff. Corrections Applied:    {'Yes' if fix_status_flags & 0x02 else 'No'}")
+    print(f"  Bits 4-2  Power State:               {(fix_status_flags >> 2) & 0x07}")
+    print(f"  Bit 5  Valid Heading:                {'Yes' if fix_status_flags & 0x20 else 'No'}")
+    print(f"  Bits 7-6  Carrier Phase Solution:    {(fix_status_flags >> 6) & 0x03}")
+    decode_battery_status(battery_status)
+    print("-" * 66)
+    print()
+
+
+# ================================================================
+#  Optional OLED output  (requires ssd1351 driver)
+# ================================================================
+
+def print_data_to_oled():
+    """Display key values on the 128x128 SPI colour OLED."""
+    if not OLED_ENABLED:
+        return
+    oled.fill(0)
+
+    fix_text   = {0: ("No Fix",  COLOR_RED),
+                  2: ("2D Fix",  COLOR_CYAN),
+                  3: ("3D Fix",  COLOR_GREEN)}.get(fix_status, ("??Fix", COLOR_MAGENTA))
+
+    oled.draw_text(0, 0,  "RaceBox",    COLOR_RED)
+    oled.draw_text(56, 0, "connected",  COLOR_GREEN)
+    oled.draw_hline(0, 11, 128, COLOR_WHITE)
+
+    y = 14
+    oled.draw_text(0, y, "GPS: " + fix_text[0], fix_text[1]);  y += 9
+    oled.draw_text(0, y, f"Lat: {latitude  / 1e7:.4f} deg", COLOR_WHITE);  y += 9
+    oled.draw_text(0, y, f"Lon: {longitude / 1e7:.4f} deg", COLOR_WHITE);  y += 9
+
+    if fix_status_flags & 0x20:
+        oled.draw_text(0, y, f"Hdg:{heading_degrees:.1f} ({compass_direction})", COLOR_CYAN)
+    else:
+        oled.draw_text(0, y, "Heading: not valid", COLOR_RED)
+    y += 9
+    oled.draw_text(0, y, f"Spd:{speed_val * 3.6 / 1000.0:.1f} km/h", COLOR_WHITE);  y += 12
+    oled.draw_text(0, y, f"Gx:{g_force_x / 1000.0:.2f} G", COLOR_BLUE);  y += 9
+    oled.draw_text(0, y, f"Gy:{g_force_y / 1000.0:.2f} G", COLOR_BLUE);  y += 9
+    oled.draw_text(0, y, f"Gz:{g_force_z / 1000.0:.2f} G", COLOR_BLUE);  y += 12
+    oled.draw_text(0, y, f"Rx:{rot_rate_x / 100.0:.1f}d/s", COLOR_YELLOW);  y += 9
+    oled.draw_text(0, y, f"Ry:{rot_rate_y / 100.0:.1f}d/s", COLOR_RED);     y += 9
+    oled.draw_text(0, y, f"Rz:{rot_rate_z / 100.0:.1f}d/s", COLOR_GREEN)
+
+    oled.show()
+
+
+# ================================================================
+#  BLE Central (client) implementation using MicroPython bluetooth
+# ================================================================
+
+class BLERaceBoxClient:
+    """
+    Pure-Python BLE central that scans for a RaceBox, connects,
+    discovers the UART TX characteristic, and subscribes to notifications.
+
+    MicroPython's bluetooth module uses an event/IRQ model rather than
+    callbacks per-characteristic, so all BLE events come through
+    _irq().
+    """
+
+    # GAP event codes
+    _IRQ_SCAN_RESULT         = const(5)
+    _IRQ_SCAN_DONE           = const(6)
+    _IRQ_PERIPHERAL_CONNECT  = const(7)
+    _IRQ_PERIPHERAL_DISCONNECT = const(8)
+    _IRQ_GATTC_SERVICE_RESULT  = const(9)
+    _IRQ_GATTC_SERVICE_DONE    = const(10)
+    _IRQ_GATTC_CHARACTERISTIC_RESULT = const(11)
+    _IRQ_GATTC_CHARACTERISTIC_DONE   = const(12)
+    _IRQ_GATTC_NOTIFY        = const(18)
+
+    # CCCD handle offset (standard BLE: descriptor is always +1 from char value handle for notify chars)
+    _NOTIFY_ENABLE = b'\x01\x00'
+
+    def __init__(self):
+        self._ble     = bluetooth.BLE()
+        self._ble.active(True)
+        self._ble.irq(self._irq)
+
+        self._conn_handle  = None
+        self._tx_val_handle = None   # value handle for TX characteristic
+        self._svc_start    = None
+        self._svc_end      = None
+        self._scanning     = False
+        self._connecting   = False
+
+    # ------------------------------------------------------------------
+    def _irq(self, event, data):
+        global do_connect, connected, racebox_addr, device_type
+
+        # ---- Scan result ----
+        if event == self._IRQ_SCAN_RESULT:
+            addr_type, addr, adv_type, rssi, adv_data = data
+            name = self._decode_name(adv_data)
+            if name:
+                print(f"BLE device found: {name}  addr={bytes(addr).hex(':')}")
+
+            if name and name.startswith("RaceBox"):
+                addr_str = bytes(addr).hex(':')
+
+                # Determine device type
+                if name.startswith("RaceBox Micro"):
+                    device_type = 1
+                elif name.startswith("RaceBox Mini"):
+                    device_type = 0
+                else:
+                    device_type = -1
+
+                # Address filter (optional)
+                if TARGET_DEVICE_ADDRESS is not None:
+                    if addr_str.lower() != TARGET_DEVICE_ADDRESS.lower():
+                        print(f"  Address {addr_str} does not match TARGET_DEVICE_ADDRESS, skipping.")
+                        return
+                    else:
+                        print(f"  Matched TARGET_DEVICE_ADDRESS {addr_str}.")
+
+                print(f"RaceBox found: '{name}'  ({addr_str})  Connecting...")
+                self._ble.gap_scan(None)   # stop scan
+                self._scanning = False
+                racebox_addr   = bytes(addr)
+                self._ble.gap_connect(addr_type, addr)
+                self._connecting = True
+
+        # ---- Scan done ----
+        elif event == self._IRQ_SCAN_DONE:
+            if self._scanning:
+                print("Scan finished without finding a RaceBox. Restarting scan...")
+                self.start_scan()
+
+        # ---- Connected ----
+        elif event == self._IRQ_PERIPHERAL_CONNECT:
+            conn_handle, addr_type, addr = data
+            self._conn_handle = conn_handle
+            self._connecting  = False
+            connected         = True
+            print(f"RaceBox Connected!  handle={conn_handle}")
+            # Start service discovery
+            self._ble.gattc_discover_services(conn_handle)
+
+        # ---- Disconnected ----
+        elif event == self._IRQ_PERIPHERAL_DISCONNECT:
+            conn_handle, addr_type, addr = data
+            self._conn_handle   = None
+            self._tx_val_handle = None
+            connected           = False
+            print("Disconnected from RaceBox! Restarting scan...")
+            if OLED_ENABLED:
+                oled.fill(0)
+                oled.draw_text(0, 40, "RaceBox DISCONNECTED", COLOR_RED)
+                oled.show()
+            self.start_scan()
+
+        # ---- Service discovery result ----
+        elif event == self._IRQ_GATTC_SERVICE_RESULT:
+            conn_handle, start_handle, end_handle, uuid = data
+            if bluetooth.UUID(bytes(uuid)) == UART_SERVICE_UUID:
+                print("Found UART service.")
+                self._svc_start = start_handle
+                self._svc_end   = end_handle
+
+        elif event == self._IRQ_GATTC_SERVICE_DONE:
+            conn_handle, status = data
+            if self._svc_start is not None:
+                self._ble.gattc_discover_characteristics(
+                    conn_handle, self._svc_start, self._svc_end)
+            else:
+                print("UART service not found, disconnecting.")
+                self._ble.gap_disconnect(conn_handle)
+
+        # ---- Characteristic discovery result ----
+        elif event == self._IRQ_GATTC_CHARACTERISTIC_RESULT:
+            conn_handle, def_handle, val_handle, properties, uuid = data
+            if bluetooth.UUID(bytes(uuid)) == TX_CHAR_UUID:
+                print(f"Found TX characteristic  val_handle={val_handle}")
+                self._tx_val_handle = val_handle
+
+        elif event == self._IRQ_GATTC_CHARACTERISTIC_DONE:
+            conn_handle, status = data
+            if self._tx_val_handle is not None:
+                # Write 0x0001 to CCCD (val_handle + 1) to enable notifications
+                cccd_handle = self._tx_val_handle + 1
+                self._ble.gattc_write(conn_handle, cccd_handle,
+                                      self._NOTIFY_ENABLE, 1)
+                print("Subscribed to TX notifications.")
+            else:
+                print("TX characteristic not found.")
+
+        # ---- Incoming notification ----
+        elif event == self._IRQ_GATTC_NOTIFY:
+            conn_handle, val_handle, notify_data = data
+            if val_handle == self._tx_val_handle:
+                payload = bytes(notify_data)
+                if len(payload) < 80:
+                    print(f"Short payload ({len(payload)} bytes) - "
+                          "expected 80 for a RaceBox Data Message.")
+                parse_payload(payload)
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _decode_name(adv_data: bytes) -> str:
+        """Extract the Complete/Shortened Local Name from raw adv_data."""
+        i = 0
+        while i < len(adv_data):
+            length = adv_data[i]
+            if length == 0:
+                break
+            ad_type = adv_data[i + 1]
+            if ad_type in (0x08, 0x09):   # Shortened / Complete Local Name
+                try:
+                    return adv_data[i + 2: i + 1 + length].decode('utf-8')
+                except Exception:
+                    pass
+            i += 1 + length
+        return ""
+
+    # ------------------------------------------------------------------
+    def start_scan(self):
+        """Start an indefinite active BLE scan."""
+        print("Starting BLE scan...")
+        self._scanning = True
+        # duration_ms=0 → scan until stopped; interval=45 ms, window=15 ms, active=True
+        self._ble.gap_scan(0, 45000, 15000, True)
+
+
+# ================================================================
+#  Serial console input  (simple single-char commands)
+# ================================================================
+
+def interpret_serial_input():
+    """
+    Poll stdin for a single character and dispatch to stub functions.
+    Non-blocking: returns immediately if nothing is available.
+    """
+    try:
+        import select
+        r, _, _ = select.select([sys.stdin], [], [], 0)
+        if not r:
+            return
+        ch = sys.stdin.read(1)
+    except Exception:
+        return
+
+    if ch == '1':
+        print("Received '1' - starting function1...")
+        function1()
+    elif ch == '2':
+        print("Received '2' - starting function2...")
+        function2()
+    elif ch == '3':
+        print("Received '3' - starting function3...")
+        function3()
+    else:
+        print(f"Unknown input '{ch}'. Enter 1, 2, or 3.")
+
+
+def function1():
+    """Stub - implement e.g. start standalone recording."""
+    print("### function1 - not yet implemented ###")
+    time.sleep_ms(1000)
+
+
+def function2():
+    """Stub - implement e.g. stop standalone recording."""
+    print("### function2 - not yet implemented ###")
+    time.sleep_ms(1000)
+
+
+def function3():
+    """Stub - implement e.g. request recorded data."""
+    print("### function3 - not yet implemented ###")
+    time.sleep_ms(1000)
+
+
+# ================================================================
+#  Main
+# ================================================================
+
+def main():
+    global updated_data
+
+    print()
+    print("  ############################################################")
+    print("  ###       ESP32 MicroPython BLE RaceBox Client           ###")
+    print("  ############################################################")
+    print()
+    if TARGET_DEVICE_ADDRESS:
+        print(f"  Will only connect to RaceBox at address: {TARGET_DEVICE_ADDRESS}")
+    else:
+        print("  Will connect to any RaceBox found (no TARGET_DEVICE_ADDRESS set).")
+    print()
+    print("  Type 1 / 2 / 3 in the REPL to call stub functions.")
+    print()
+
+    client = BLERaceBoxClient()
+    client.start_scan()
+
+    # ---- Main loop ----
+    while True:
+        interpret_serial_input()
+
+        if updated_data:
+            print_data_to_serial()
+            print_data_to_oled()
+            updated_data = False
+
+        time.sleep_ms(20)   # yield; BLE IRQs fire in background
+
+
+if __name__ == "__main__":
+    main()
